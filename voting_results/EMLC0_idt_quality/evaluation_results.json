@@ -1,0 +1,21 @@
+{
+  "global_idt_accuracy": 1.0,
+  "global_idt_f1": 1.0,
+  "global_idt_precision": 1.0,
+  "global_idt_recall": 1.0,
+  "direct_voting_accuracy": 1.0,
+  "improvement": 0.0,
+  "total_samples": 912,
+  "idt_pred_distribution": {
+    "1": 356,
+    "0": 556
+  },
+  "voting_pred_distribution": {
+    "1": 356,
+    "0": 556
+  },
+  "true_label_distribution": {
+    "1": 356,
+    "0": 556
+  }
+}

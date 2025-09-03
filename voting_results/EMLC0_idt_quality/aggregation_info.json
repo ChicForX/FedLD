@@ -1,0 +1,60 @@
+{
+  "num_clients": 5,
+  "client_weights": [
+    0.9615384607311388,
+    0.009615384817215312,
+    0.009615384817215312,
+    0.009615384817215312,
+    0.009615384817215312
+  ],
+  "client_info": [
+    {
+      "client_id": 0,
+      "data_size": 1637,
+      "accuracy": 0.0,
+      "test_accuracy": 1.0,
+      "weight_method": "idt_quality"
+    },
+    {
+      "client_id": 1,
+      "data_size": 630,
+      "accuracy": 0.0,
+      "test_accuracy": 1.0,
+      "weight_method": "idt_quality"
+    },
+    {
+      "client_id": 2,
+      "data_size": 666,
+      "accuracy": 0.0,
+      "test_accuracy": 1.0,
+      "weight_method": "idt_quality"
+    },
+    {
+      "client_id": 3,
+      "data_size": 1000,
+      "accuracy": 0.0,
+      "test_accuracy": 1.0,
+      "weight_method": "idt_quality"
+    },
+    {
+      "client_id": 4,
+      "data_size": 620,
+      "accuracy": 0.0,
+      "test_accuracy": 1.0,
+      "weight_method": "idt_quality"
+    }
+  ],
+  "voting_analysis": {
+    "voting_accuracy": 1.0,
+    "true_distribution": {
+      "0": 1997,
+      "1": 1644
+    },
+    "voted_distribution": {
+      "0": 1997,
+      "1": 1644
+    },
+    "total_samples": 3641
+  },
+  "method": "simple_voting_aggregation"
+}
