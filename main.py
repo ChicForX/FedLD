@@ -5,7 +5,9 @@ from data.dataset import data_label_skew
 from model.client import GNNClient
 from model.aggregate.idt_voting import SimpleVotingIDTAggregator
 from model.idt import get_activations
-from utils.mia import MIAttacker
+from utils.loss_mia import MIAttacker
+from utils.sia import SourceInferenceAttackerIDT
+from utils.shadow_mia import ShadowMIAttacker, default_shadow_factory
 from torch_geometric.data import Batch
 import os
 import pickle
@@ -199,7 +201,7 @@ def run_federated_voting(args):
     try:
         attacker = MIAttacker()
         for client in valid_clients:
-            print(f"[Client {client.client_id}] MIA Attack")
+            print(f"[Client {client.client_id}] loss-based MIA Attack")
             try:
                 # 获取训练数据作为成员数据（1/20采样）
                 train_data = next(iter(train_loaders[client.client_id]))
@@ -216,9 +218,78 @@ def run_federated_voting(args):
                 attacker.train_attack_model(client.idt, member_batch, nonmember_batch)
                 print(f"[Client {client.client_id}] MIA attack completed")
             except Exception as e:
-                print(f"[Client {client.client_id}] MIA attack failed: {str(e)}")
+                print(f"[Client {client.client_id}] loss-based MIA attack failed: {str(e)}")
     except Exception as e:
         print(f"MIA setup failed: {str(e)}")
+
+    print("\n=== Running Shadow-Model MIA (per-client) ===")
+
+    shadow_attacker = ShadowMIAttacker(
+        shadow_factory=default_shadow_factory,
+        include_loss_feature=True,
+        random_state=args.seed,
+        max_samples_per_shadow=2000,  # 可选：限制每个shadow收集样本数
+    )
+
+    for client in valid_clients:
+        cid = client.client_id
+        print(f"\n[Client {cid}] Shadow-MIA")
+
+        try:
+            # member: 来自该client训练集（1/20采样）
+            train_data = next(iter(train_loaders[cid]))
+            train_list = train_data.to_data_list()
+            k = max(1, len(train_list) // 20)
+            member_batch = Batch.from_data_list(train_list[:k])
+
+            # non-member: 来自该client测试集（数量=k）
+            test_list = test_batches[cid].to_data_list()
+            nonmember_batch = Batch.from_data_list(test_list[:k])
+
+            # 训练影子攻击并打印 AUC
+            stats = shadow_attacker.train_attack_model(
+                target_model=client.idt,  # 如果baseline是GNN则换成 client.model
+                member_batch=member_batch,
+                nonmember_batch=nonmember_batch,
+                num_shadows=5,  # 影子模型数量
+                seed=args.seed + cid,  # 每个client不同随机种子
+                shadow_epochs=5,  # GNN shadow训练轮数（IDT会忽略）
+                shadow_lr=1e-3,
+            )
+
+            print(
+                f"[Client {cid}] "
+                f"AUC_target_transfer={stats['auc_target_transfer']:.4f} | "
+                f"AUC_shadow_train={stats['auc_shadow_train']:.4f} | "
+                f"AUC_shadow_eval={stats.get('auc_shadow_eval', float('nan')):.4f}"
+            )
+
+        except Exception as e:
+            print(f"[Client {cid}] Shadow-MIA failed: {e}")
+
+    print("\n=== Running Source Inference Attack (SIA) ===")
+
+    # 1) 所有客户端的被攻击模型（IDT）
+    idts_by_cid = {c.client_id: c.idt for c in valid_clients}
+
+    # 2) 每个客户端取一小批 member graphs 作为“已知成员”目标
+    targets_by_true_cid = {}
+    for client in valid_clients:
+        cid = client.client_id
+        train_data = next(iter(train_loaders[cid]))
+        train_list = train_data.to_data_list()
+        k = max(1, len(train_list) // 20)
+        targets_by_true_cid[cid] = Batch.from_data_list(train_list[:k]).to("cpu")
+
+    sia = SourceInferenceAttackerIDT(
+        loss_mode="cross_entropy",
+        temperature=1.0,
+        use_probs=True,
+        print_ties=True,
+    )
+    metrics, sia_results = sia.eval_asr(idts_by_cid, targets_by_true_cid)
+
+    print(metrics)
 
     print("\n=== Federated Learning Completed ===")
 
