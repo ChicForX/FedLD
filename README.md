@@ -1,4 +1,4 @@
-# FedLD: Protecting Privacy and Enhancing Utility in Heterogeneous Graph Federated Learning
+# FedLD: Mitigating Membership Inference Attack in Heterogeneous Graph Federated Learning
 
 This repository provides a reference implementation of FedLD (Federated Logical Distillation) for heterogeneous Graph Federated Learning. 
 
