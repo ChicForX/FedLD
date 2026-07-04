@@ -103,24 +103,115 @@ class GNNClient:
             self.model.load_state_dict(best_state)
         self.model.eval()
 
+    @torch.no_grad()
+    def _adaptive_capacity(self, idt_batch):
+        import numpy as np
+
+        a = self.args
+        w_min = getattr(a, "adapt_w_min", 8)
+        w_max = getattr(a, "adapt_w_max", 32)
+        k_ratio_min = getattr(a, "adapt_k_ratio_min", 0.001)
+        k_ratio_max = getattr(a, "adapt_k_ratio_max", 0.005)
+
+        self.model.eval()
+        dev = next(self.model.parameters()).device
+        b = idt_batch.to(dev)
+
+        H = self.model.get_graph_representation(b).detach().cpu().numpy().astype(np.float64)
+        H = H - H.mean(axis=0, keepdims=True)
+        if H.shape[0] < 2 or np.allclose(H, 0.0):
+            srank = 1
+        else:
+            sv = np.linalg.svd(H, compute_uv=False)
+            sv = sv[sv > 1e-12]
+            if len(sv) == 0:
+                srank = 1
+            else:
+                energy = np.cumsum(sv ** 2) / np.sum(sv ** 2)
+                srank = int(np.searchsorted(energy, 0.99) + 1)
+
+        try:
+            n_graphs = int(idt_batch.num_graphs)
+        except Exception:
+            n_graphs = int(b.y.size(0)) if hasattr(b, "y") else 100
+
+        k_min = max(2, int(round(k_ratio_min * n_graphs)))
+        k_max = max(k_min + 1, int(round(k_ratio_max * n_graphs)))
+
+        logits = self.model.out(self.model.get_graph_representation(b))
+        z = logits.detach().cpu().numpy().astype(np.float64)
+        if z.ndim == 2 and z.shape[1] >= 2:
+            sz = np.sort(z, axis=1)
+            margins = sz[:, -1] - sz[:, -2]
+            m0 = float(margins.mean())
+            sd = float(margins.std())
+            if sd < 1e-8:
+                frac = 0.5
+            else:
+                frac = 1.0 / (1.0 + np.exp(-(m0 / (sd + 1e-8) - 1.0)))
+        else:
+            frac = 0.5
+
+        k_final = int(round(k_min + (k_max - k_min) * frac))
+        k_final = max(k_min, min(k_max, k_final))
+        k_inner = max(1, k_final // 2)
+
+        support_cap = max(w_min, n_graphs // max(1, 2 * k_final))
+        w_max_local = int(max(w_min, min(w_max, support_cap)))
+
+        print(f"[Client {self.client_id}] Adaptive capacity budget: "
+              f"srank={srank} (diagnostic only), n_graphs={n_graphs}, "
+              f"candidate_width=[{w_min},{w_max_local}], "
+              f"k_range=[{k_min},{k_max}], frac={frac:.3f} -> "
+              f"k_inner={k_inner}, k_final={k_final}")
+
+        return w_max_local, k_inner, k_final
+
     def distill_to_idt(self, use_pred=False):
         print(f"IDT Parameters: width={self.args.width}, sample_size={self.args.sample_size}, "
               f"layer_depth={self.args.layer_depth}, max_depth={self.args.max_depth}, "
               f"ccp_alpha={self.args.ccp_alpha}")
+        idt_batch = self.train_val_batch
         with torch.no_grad():
-            values = get_activations(self.train_val_batch, self.model)
+            values = get_activations(idt_batch, self.model)
             if use_pred:
-                y = self.train_val_batch.y.detach().cpu().numpy()
+                y = idt_batch.y.detach().cpu().numpy()
             else:
-                y = self.model(self.train_val_batch).argmax(dim=-1).detach().cpu().numpy()
+                dev = next(self.model.parameters()).device
+                y = self.model(idt_batch.to(dev)).argmax(dim=-1).detach().cpu().numpy()
+                idt_batch = idt_batch.to("cpu")
+
+        _width = self.args.width
+        _min_leaf_inner = getattr(self.args, "min_leaf_inner", 1)
+        _min_leaf_final = getattr(self.args, "min_leaf_final", 1)
+        if getattr(self.args, "adaptive_capacity", False):
+            _width, _min_leaf_inner, _min_leaf_final = self._adaptive_capacity(idt_batch)
+
+        use_adaptive_width = bool(getattr(self.args, "adaptive_capacity", False))
 
         self.idt = IDT(
-            width=self.args.width,
+            width=_width,
             sample_size=self.args.sample_size,
             layer_depth=self.args.layer_depth,
             max_depth=self.args.max_depth,
-            ccp_alpha=self.args.ccp_alpha
-        ).fit(self.train_val_batch, values, y=y)
+            ccp_alpha=self.args.ccp_alpha,
+            min_leaf_inner=_min_leaf_inner,
+            min_leaf_final=_min_leaf_final,
+            adaptive_width=use_adaptive_width,
+            width_min=getattr(self.args, "adapt_w_min", 8),
+            width_step=getattr(self.args, "adapt_width_step", 4),
+            width_patience=getattr(self.args, "adapt_width_patience", 2),
+            adapt_r2_threshold=getattr(self.args, "adapt_r2_threshold", 0.01),
+            adapt_diversity_threshold=getattr(self.args, "adapt_diversity_threshold", 0.05),
+            adapt_target_gain_threshold=getattr(self.args, "adapt_target_gain_threshold", 0.002),
+            verbose_adaptive_width=getattr(self.args, "adapt_width_verbose", True),
+        ).fit(idt_batch, values, y=y)
+
+        if use_adaptive_width and hasattr(self.idt, "adaptive_width_history"):
+            eff_widths = [h.get("effective_width", 0) for h in self.idt.adaptive_width_history]
+            print(f"[Client {self.client_id}] Distillation-selected effective widths: {eff_widths}")
+
+        return self.idt
 
     def evaluate(self):
         result = {}

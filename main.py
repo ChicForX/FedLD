@@ -121,7 +121,17 @@ def run_federated_voting(args):
             'sample_size': args.sample_size,
             'layer_depth': args.layer_depth,
             'max_depth': args.max_depth,
-            'ccp_alpha': args.ccp_alpha
+            'ccp_alpha': args.ccp_alpha,
+            'min_leaf_inner': args.min_leaf_inner,
+            'min_leaf_final': args.min_leaf_final,
+            'adaptive_width': args.adaptive_capacity,
+            'width_min': args.adapt_w_min,
+            'width_step': args.adapt_width_step,
+            'width_patience': args.adapt_width_patience,
+            'adapt_r2_threshold': args.adapt_r2_threshold,
+            'adapt_diversity_threshold': args.adapt_diversity_threshold,
+            'adapt_target_gain_threshold': args.adapt_target_gain_threshold,
+            'verbose_adaptive_width': args.adapt_width_verbose,
         }
     )
 
@@ -384,6 +394,32 @@ if __name__ == '__main__':
     parser.add_argument('--layer_depth', type=int, default=2)
     parser.add_argument('--max_depth', type=int, default=None)
     parser.add_argument('--ccp_alpha', type=float, default=1e-3)
+    parser.add_argument('--min_leaf_inner', type=int, default=5,
+                        help='Minimum samples per leaf for inner rule-extractor trees.')
+    parser.add_argument('--min_leaf_final', type=int, default=10,
+                        help='Minimum samples per leaf for the final hard-label tree.')
+    parser.add_argument('--adaptive_capacity', action='store_true', default=True,
+                        help='Enable per-client adaptive k and distillation-driven adaptive IDT width.')
+    parser.add_argument('--adapt_w_min', type=int, default=8,
+                        help='Minimum number of logical feature generators retained per activation layer.')
+    parser.add_argument('--adapt_w_max', type=int, default=32,
+                        help='Maximum candidate budget for adaptive IDT width.')
+    parser.add_argument('--adapt_width_step', type=int, default=4,
+                        help='Number of candidate inner trees added per adaptive-width round.')
+    parser.add_argument('--adapt_width_patience', type=int, default=2,
+                        help='Stop after this many rounds with no accepted useful candidate.')
+    parser.add_argument('--adapt_r2_threshold', type=float, default=0.0,
+                        help='Minimum activation-fitting R2 for adaptive-width candidate scoring.')
+    parser.add_argument('--adapt_diversity_threshold', type=float, default=0.05,
+                        help='Minimum novelty/diversity for adaptive-width candidate scoring.')
+    parser.add_argument('--adapt_target_gain_threshold', type=float, default=0.002,
+                        help='Minimum temporary final-layer score gain required to increase effective width.')
+    parser.add_argument('--adapt_width_verbose', action='store_true', default=True,
+                        help='Print effective widths selected during IDT distillation.')
+    parser.add_argument('--adapt_k_ratio_min', type=float, default=0.001,
+                        help='k_min = max(2, round(adapt_k_ratio_min * n_client_graphs)).')
+    parser.add_argument('--adapt_k_ratio_max', type=float, default=0.005,
+                        help='k_max = max(k_min+1, round(adapt_k_ratio_max * n_client_graphs)).')
     parser.add_argument('--devices', type=int, default=1)
     parser.add_argument('--samples_per_label', type=int, default=1000)
 
@@ -402,6 +438,8 @@ if __name__ == '__main__':
     print("=== Federated IDT with Voting Aggregation ===")
     print(f"Dataset: {args.dataset} | Weight Method: {args.weight_method}")
     print(f"IDT Params: width={args.width}, depth={args.layer_depth}, max_depth={args.max_depth}")
+    print(f"Leaf support: inner={args.min_leaf_inner}, final={args.min_leaf_final} | "
+          f"adaptive_capacity={args.adaptive_capacity}")
     print("=" * 60)
 
     run_federated_voting(args)

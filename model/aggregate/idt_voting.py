@@ -99,7 +99,17 @@ class SimpleVotingIDTAggregator:
             'sample_size': 1000,
             'layer_depth': 2,
             'max_depth': None,
-            'ccp_alpha': 1e-3
+            'ccp_alpha': 1e-3,
+            'min_leaf_inner': 1,
+            'min_leaf_final': 1,
+            'adaptive_width': False,
+            'width_min': 8,
+            'width_step': 4,
+            'width_patience': 2,
+            'adapt_r2_threshold': 0.0,
+            'adapt_diversity_threshold': 0.05,
+            'adapt_target_gain_threshold': 0.002,
+            'verbose_adaptive_width': False,
         }
 
         if idt_params:
@@ -143,7 +153,17 @@ class SimpleVotingIDTAggregator:
             sample_size=default_params['sample_size'],
             layer_depth=default_params['layer_depth'],
             max_depth=default_params['max_depth'],
-            ccp_alpha=default_params['ccp_alpha']
+            ccp_alpha=default_params['ccp_alpha'],
+            min_leaf_inner=default_params['min_leaf_inner'],
+            min_leaf_final=default_params['min_leaf_final'],
+            adaptive_width=default_params['adaptive_width'],
+            width_min=default_params['width_min'],
+            width_step=default_params['width_step'],
+            width_patience=default_params['width_patience'],
+            adapt_r2_threshold=default_params['adapt_r2_threshold'],
+            adapt_diversity_threshold=default_params['adapt_diversity_threshold'],
+            adapt_target_gain_threshold=default_params['adapt_target_gain_threshold'],
+            verbose_adaptive_width=default_params['verbose_adaptive_width'],
         )
 
         # 使用投票结果作为监督信号训练IDT
@@ -151,6 +171,8 @@ class SimpleVotingIDTAggregator:
 
         print(f"[VotingAggregator] Global IDT training completed!")
         print(f"  IDT structure: {len(self.global_idt.layer)} layers + output layer")
+        if hasattr(self.global_idt, "layer_widths"):
+            print(f"  Global IDT effective widths: {self.global_idt.layer_widths}")
 
         return self.global_idt
 

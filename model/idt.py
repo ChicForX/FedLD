@@ -8,127 +8,386 @@ import torch
 from torch_geometric.utils import to_scipy_sparse_matrix
 from torch_geometric.nn import global_mean_pool, global_add_pool
 from torch_geometric.data import Batch
+from joblib import Parallel, delayed
+
+
+def _fit_one_inner_layer(layer_depth, depth_indices, x, value,
+                         node_indices, adj, node_sample_weight, min_leaf=1):
+    layer = IDTInnerLayer(layer_depth, depth_indices, min_leaf=min_leaf)
+    layer.fit(
+        x[node_indices],
+        value[node_indices],
+        adj,
+        node_sample_weight[node_indices] if node_sample_weight is not None else None,
+    )
+    return layer
+
+
+def _max_abs_corr_against_selected(candidate_features, selected_features, eps=1e-12):
+    if selected_features is None or len(selected_features) == 0:
+        return 0.0
+
+    cand = np.asarray(candidate_features, dtype=np.float64)
+    if cand.ndim == 1:
+        cand = cand.reshape(-1, 1)
+
+    selected = np.concatenate(selected_features, axis=1).astype(np.float64)
+    if selected.ndim == 1:
+        selected = selected.reshape(-1, 1)
+
+    cand_std = cand.std(axis=0)
+    sel_std = selected.std(axis=0)
+    cand = cand[:, cand_std > eps]
+    selected = selected[:, sel_std > eps]
+
+    if cand.shape[1] == 0 or selected.shape[1] == 0:
+        return 0.0
+
+    cand = cand - cand.mean(axis=0, keepdims=True)
+    selected = selected - selected.mean(axis=0, keepdims=True)
+    cand = cand / (cand.std(axis=0, keepdims=True) + eps)
+    selected = selected / (selected.std(axis=0, keepdims=True) + eps)
+
+    corr = np.abs(cand.T @ selected) / max(1, cand.shape[0] - 1)
+    if corr.size == 0:
+        return 0.0
+    return float(np.nanmax(corr))
+
+
+def _candidate_layer_score(layer, feature_block, selected_feature_blocks,
+                           r2_threshold=0.01, diversity_threshold=0.05):
+    r2 = max(0.0, float(getattr(layer, "fit_r2_", 0.0)))
+    max_corr = _max_abs_corr_against_selected(feature_block, selected_feature_blocks)
+    diversity = 1.0 - max_corr
+    score = r2 * max(0.0, diversity)
+    usable = (r2 >= r2_threshold) and (diversity >= diversity_threshold)
+
+    return {
+        "score": float(score),
+        "r2": float(r2),
+        "diversity": float(diversity),
+        "max_corr": float(max_corr),
+        "usable": bool(usable),
+    }
 
 
 class IDT:
-    def __init__(self, width=10, sample_size=20, layer_depth=3, max_depth=5, ccp_alpha=.0):
+    def __init__(self, width=10, sample_size=20, layer_depth=3, max_depth=5, ccp_alpha=.0,
+                 min_leaf_inner=1, min_leaf_final=1,
+                 adaptive_width=False, width_min=4, width_step=4, width_patience=2,
+                 adapt_r2_threshold=0.01, adapt_diversity_threshold=0.05,
+                 adapt_target_gain_threshold=0.002,
+                 verbose_adaptive_width=False):
         self.width = width
         self.sample_size = sample_size
         self.layer_depth = layer_depth
         self.max_depth = max_depth
         self.ccp_alpha = ccp_alpha
+        self.min_leaf_inner = min_leaf_inner
+        self.min_leaf_final = min_leaf_final
+        self.adaptive_width = adaptive_width
+        self.width_min = max(1, int(width_min))
+        self.width_step = max(1, int(width_step))
+        self.width_patience = max(1, int(width_patience))
+        self.adapt_r2_threshold = float(adapt_r2_threshold)
+        self.adapt_diversity_threshold = float(adapt_diversity_threshold)
+        self.adapt_target_gain_threshold = float(adapt_target_gain_threshold)
+        self.verbose_adaptive_width = bool(verbose_adaptive_width)
         self.layer = None
         self.out_layer = None
+        self.layer_widths = []
+        self.adaptive_width_history = []
 
     def fit(self, batch, values, y, sample_weight=None):
-        # 统一到 CPU，避免 torch 操作（如 torch.isin）出现 cuda:0 / cpu 不一致
         batch = batch.to("cpu")
 
         if self.sample_size is None or self.sample_size > batch.num_graphs:
             self.sample_size = batch.num_graphs
         self.layer = []
+        self.layer_widths = []
+        self.adaptive_width_history = []
 
-        # 构建全局邻接与节点特征（CPU → NumPy）
         adj_full = to_scipy_sparse_matrix(batch.edge_index, num_nodes=batch.x.shape[0]).tobsr()
         x = batch.x.numpy()
         node_sample_weight = sample_weight[batch.batch] if sample_weight is not None else None
         depth_indices = [x.shape[1]]
 
         for i, value in enumerate(values):
-            new_layers = []
-            depth_indices_new = []
+            if self.adaptive_width:
+                new_layers, x_new, layer_history = self._fit_one_value_adaptive_width(
+                    layer_id=i,
+                    batch=batch,
+                    x=x,
+                    value=value,
+                    depth_indices=depth_indices,
+                    adj_full=adj_full,
+                    node_sample_weight=node_sample_weight,
+                    y_graph=y,
+                )
+                effective_width = len(new_layers)
+                depth_indices_new = [2 ** (self.layer_depth + 1) - 1] * effective_width
+                self.adaptive_width_history.append(layer_history)
 
-            for _ in range(self.width):
-                new_layers.append(IDTInnerLayer(self.layer_depth, depth_indices))
+                if self.verbose_adaptive_width:
+                    print(
+                        f"[IDT] Adaptive width layer={i}: "
+                        f"effective_width={effective_width}, "
+                        f"candidate_budget={self.width}, "
+                        f"mean_r2={layer_history.get('mean_r2', 0.0):.4f}, "
+                        f"mean_diversity={layer_history.get('mean_diversity', 0.0):.4f}"
+                    )
+            else:
+                samples = []
+                for _ in range(self.width):
+                    graph_indices = np.random.choice(batch.num_graphs, size=self.sample_size, replace=False)
+                    graph_indices = torch.tensor(graph_indices, dtype=torch.long)
 
-                # Step 1: graph-level sampling（在 CPU）
-                graph_indices = np.random.choice(batch.num_graphs, size=self.sample_size, replace=False)
-                graph_indices = torch.tensor(graph_indices, dtype=torch.long)  # CPU tensor
+                    small_batch = Batch.from_data_list(batch.index_select(graph_indices))
+                    node_mask = torch.isin(batch.batch, graph_indices)
+                    node_indices = node_mask.nonzero(as_tuple=False).view(-1).numpy()
+                    adj = to_scipy_sparse_matrix(small_batch.edge_index, num_nodes=small_batch.x.shape[0]).tobsr()
+                    samples.append((node_indices, adj))
 
-                # Step 2: 由选中图索引构建子 batch
-                small_batch_list = batch.index_select(graph_indices)
-                small_batch = Batch.from_data_list(small_batch_list)
-
-                # Step 3: 找到原 batch 中属于这些图的节点索引
-                node_mask = torch.isin(batch.batch, graph_indices)  # 两者均在 CPU
-                node_indices = node_mask.nonzero(as_tuple=False).view(-1)
-
-                # Step 4: 计算子 batch 的邻接矩阵
-                adj = to_scipy_sparse_matrix(small_batch.edge_index, num_nodes=small_batch.x.shape[0]).tobsr()
-
-                # Step 5: 训练该子层
-                new_layers[-1].fit(
-                    x[node_indices],
-                    value[node_indices],
-                    adj,
-                    node_sample_weight[node_indices] if node_sample_weight is not None else None
+                new_layers = Parallel(n_jobs=2, prefer="threads")(
+                    delayed(_fit_one_inner_layer)(
+                        self.layer_depth,
+                        depth_indices,
+                        x,
+                        value,
+                        node_indices,
+                        adj,
+                        node_sample_weight,
+                        self.min_leaf_inner,
+                    )
+                    for node_indices, adj in samples
                 )
 
-                depth_indices_new.append(2 ** (self.layer_depth + 1) - 1)
+                x_new = np.concatenate([layer.predict(x, adj_full) for layer in new_layers], axis=1)
+                depth_indices_new = [2 ** (self.layer_depth + 1) - 1] * self.width
 
-            # 该层输出拼接到特征
-            x_new = np.concatenate([layer.predict(x, adj_full) for layer in new_layers], axis=1)
             x = np.concatenate([x, x_new], axis=1)
             self.layer += new_layers
+            self.layer_widths.append(len(new_layers))
             depth_indices += depth_indices_new
 
-        # 最终分类层
+        if self.layer_widths:
+            self.width = max(self.layer_widths)
+
         self.out_layer = IDTFinalLayer(
             self.max_depth,
             self.ccp_alpha,
-            depth_indices
+            depth_indices,
+            min_leaf=self.min_leaf_final,
         )
         self.out_layer.fit(x, batch.batch, y)
         return self
 
-    def predict(self, batch):
+    def _temporary_final_score(self, x_node, batch_index, y_graph):
+        y_arr = np.asarray(y_graph).reshape(-1)
+        if len(y_arr) == 0:
+            return 0.0
+
+        Xg = _pool(x_node, batch_index)
+        try:
+            clf = DecisionTreeClassifier(
+                max_depth=self.max_depth,
+                ccp_alpha=self.ccp_alpha,
+                min_samples_leaf=self.min_leaf_final,
+                min_samples_split=max(2, 2 * self.min_leaf_final),
+            )
+            clf.fit(Xg, y_arr)
+            pred = clf.predict(Xg)
+            return float((pred == y_arr).mean())
+        except Exception:
+            return 0.0
+
+    def _fit_one_value_adaptive_width(self, layer_id, batch, x, value, depth_indices,
+                                      adj_full, node_sample_weight, y_graph):
+        selected_layers = []
+        selected_feature_blocks = []
+        selected_stats = []
+
+        best_layers = None
+        best_feature_blocks = None
+        best_stats = None
+        best_score = -1.0
+
+        max_width = max(self.width_min, int(self.width))
+        no_gain_rounds = 0
+        total_candidates = 0
+        base_score = self._temporary_final_score(x, batch.batch.cpu(), y_graph)
+
+        while len(selected_layers) < max_width:
+            remaining = max_width - len(selected_layers)
+            cur_step = min(self.width_step, remaining)
+
+            samples = []
+            for _ in range(cur_step):
+                graph_indices = np.random.choice(batch.num_graphs, size=self.sample_size, replace=False)
+                graph_indices = torch.tensor(graph_indices, dtype=torch.long)
+                small_batch = Batch.from_data_list(batch.index_select(graph_indices))
+                node_mask = torch.isin(batch.batch, graph_indices)
+                node_indices = node_mask.nonzero(as_tuple=False).view(-1).numpy()
+                adj = to_scipy_sparse_matrix(small_batch.edge_index, num_nodes=small_batch.x.shape[0]).tobsr()
+                samples.append((node_indices, adj))
+
+            candidate_layers = Parallel(n_jobs=2, prefer="threads")(
+                delayed(_fit_one_inner_layer)(
+                    self.layer_depth,
+                    depth_indices,
+                    x,
+                    value,
+                    node_indices,
+                    adj,
+                    node_sample_weight,
+                    self.min_leaf_inner,
+                )
+                for node_indices, adj in samples
+            )
+
+            total_candidates += len(candidate_layers)
+
+            candidate_records = []
+            for layer in candidate_layers:
+                feature_block = layer.predict(x, adj_full)
+                stat = _candidate_layer_score(
+                    layer,
+                    feature_block,
+                    selected_feature_blocks,
+                    r2_threshold=self.adapt_r2_threshold,
+                    diversity_threshold=self.adapt_diversity_threshold,
+                )
+                candidate_records.append((stat["score"], layer, feature_block, stat))
+
+            candidate_records.sort(key=lambda t: t[0], reverse=True)
+            for _, layer, feature_block, stat in candidate_records:
+                selected_layers.append(layer)
+                selected_feature_blocks.append(feature_block)
+                selected_stats.append(stat)
+                if len(selected_layers) >= max_width:
+                    break
+
+            x_candidate = np.concatenate([x] + selected_feature_blocks, axis=1)
+            current_score = self._temporary_final_score(x_candidate, batch.batch.cpu(), y_graph)
+
+            if len(selected_layers) < self.width_min:
+                continue
+
+            if best_layers is None:
+                best_layers = list(selected_layers)
+                best_feature_blocks = list(selected_feature_blocks)
+                best_stats = list(selected_stats)
+                best_score = current_score
+                no_gain_rounds = 0
+                continue
+
+            gain = current_score - best_score
+            if gain >= self.adapt_target_gain_threshold:
+                best_layers = list(selected_layers)
+                best_feature_blocks = list(selected_feature_blocks)
+                best_stats = list(selected_stats)
+                best_score = current_score
+                no_gain_rounds = 0
+            else:
+                no_gain_rounds += 1
+
+            if no_gain_rounds >= self.width_patience:
+                break
+
+        if best_layers is not None:
+            selected_layers = best_layers
+            selected_feature_blocks = best_feature_blocks
+            selected_stats = best_stats
+
+        if len(selected_layers) == 0:
+            graph_indices = np.random.choice(batch.num_graphs, size=self.sample_size, replace=False)
+            graph_indices = torch.tensor(graph_indices, dtype=torch.long)
+            small_batch = Batch.from_data_list(batch.index_select(graph_indices))
+            node_mask = torch.isin(batch.batch, graph_indices)
+            node_indices = node_mask.nonzero(as_tuple=False).view(-1)
+            adj = to_scipy_sparse_matrix(small_batch.edge_index, num_nodes=small_batch.x.shape[0]).tobsr()
+
+            layer = _fit_one_inner_layer(
+                self.layer_depth, depth_indices, x, value,
+                node_indices, adj, node_sample_weight, self.min_leaf_inner
+            )
+            feature_block = layer.predict(x, adj_full)
+            stat = _candidate_layer_score(
+                layer,
+                feature_block,
+                [],
+                r2_threshold=self.adapt_r2_threshold,
+                diversity_threshold=self.adapt_diversity_threshold,
+            )
+            selected_layers = [layer]
+            selected_feature_blocks = [feature_block]
+            selected_stats = [stat]
+            total_candidates += 1
+            best_score = self._temporary_final_score(
+                np.concatenate([x, feature_block], axis=1), batch.batch.cpu(), y_graph
+            )
+
+        x_new = np.concatenate(selected_feature_blocks, axis=1)
+        mean_r2 = float(np.mean([s["r2"] for s in selected_stats])) if selected_stats else 0.0
+        mean_div = float(np.mean([s["diversity"] for s in selected_stats])) if selected_stats else 0.0
+        min_support = int(min([getattr(l, "min_leaf_support_", 0) for l in selected_layers])) if selected_layers else 0
+
+        history = {
+            "layer_id": int(layer_id),
+            "effective_width": int(len(selected_layers)),
+            "candidate_budget": int(max_width),
+            "total_candidates_trained": int(total_candidates),
+            "base_target_score": float(base_score),
+            "selected_target_score": float(best_score),
+            "mean_r2": mean_r2,
+            "mean_diversity": mean_div,
+            "min_inner_leaf_support": min_support,
+        }
+
+        return selected_layers, x_new, history
+
+    def _forward_inner_layers(self, batch):
+        batch = batch.to("cpu")
         x = batch.x.cpu().numpy()
         adj = to_scipy_sparse_matrix(batch.edge_index.cpu(), num_nodes=x.shape[0]).tobsr()
-        for i in range(len(self.layer) // self.width):
+
+        cursor = 0
+        layer_widths = self.layer_widths if getattr(self, "layer_widths", None) else [
+            self.width] * (len(self.layer) // max(1, self.width))
+        for w in layer_widths:
             x_new = np.concatenate(
-                [self.layer[j].predict(x, adj) for j in range(i * self.width, (i + 1) * self.width)],
+                [self.layer[j].predict(x, adj) for j in range(cursor, cursor + w)],
                 axis=1
             )
             x = np.concatenate([x, x_new], axis=1)
-        return self.out_layer.predict(x, batch.batch.cpu())
+            cursor += w
+        return x, batch.batch.cpu()
+
+    def predict(self, batch):
+        x, batch_index = self._forward_inner_layers(batch)
+        return self.out_layer.predict(x, batch_index)
 
     def predict_proba(self, batch):
-        """
-        返回图级 (num_graphs, num_classes) 概率。
-        与 predict 相同的特征构建流程，但末端调用输出层 dt 的 predict_proba。
-        期望 batch 为 PyG 的 Batch（含 .x/.edge_index/.batch）
-        """
-        # 逐层构造节点级特征
-        x = batch.x.cpu().numpy()
-        adj = to_scipy_sparse_matrix(batch.edge_index.cpu(), num_nodes=x.shape[0]).tobsr()
-        for i in range(len(self.layer) // self.width):
-            x_new = np.concatenate(
-                [self.layer[j].predict(x, adj) for j in range(i * self.width, (i + 1) * self.width)],
-                axis=1
-            )
-            x = np.concatenate([x, x_new], axis=1)
-
-        # 图级池化 → 输出层概率
-        X_graph = _pool(x, batch.batch.cpu())
+        x, batch_index = self._forward_inner_layers(batch)
+        X_graph = _pool(x, batch_index)
         return self.out_layer.dt.predict_proba(X_graph)
 
     def compute_loss_per_sample(self, batch, eps=1e-12):
-        """
-        返回逐样本交叉熵损失 (num_graphs,)：
-          -log P_y；若 y 的类别在训练中未出现，则回退为 -log max_c P_c
-        """
-        P = self.predict_proba(batch)  # (N, C)
+        P = self.predict_proba(batch)
         y = batch.y.cpu().numpy().astype(int)
         classes = self.out_layer.dt.classes_
         class_to_col = {c: i for i, c in enumerate(classes)}
         losses = np.empty(len(y), dtype=float)
         for i, yi in enumerate(y):
             j = class_to_col.get(yi, None)
-            if j is None:  # 未见过类别 → 无标签代理损失
+            if j is None:
                 losses[i] = -np.log(P[i].max() + eps)
             else:
                 losses[i] = -np.log(P[i, j] + eps)
         return losses
+
+    def compute_loss(self, batch, eps=1e-12):
+        return self.compute_loss_per_sample(batch, eps=eps)
 
     def accuracy(self, batch):
         prediction = self.predict(batch)
@@ -143,32 +402,47 @@ class IDT:
             relevant |= layer._relevant()
         return self
 
-    def save_image(self, path):
+    def _plot_layers(self, show=False, path=None):
         import matplotlib.pyplot as plt
+
+        layer_widths = getattr(self, "layer_widths", None)
+        if not layer_widths:
+            layer_widths = [self.width] * (len(self.layer) // max(1, self.width))
+
+        ncols = max(1, max(layer_widths) if layer_widths else self.width)
+        nrows = len(layer_widths) + 1
+
         fig, axs = plt.subplots(
-            ncols=self.width, nrows=len(self.layer) // self.width + 1,
-            figsize=(4 * self.width, 4 * (len(self.layer) // self.width + 1))
+            ncols=ncols,
+            nrows=nrows,
+            figsize=(4 * ncols, 4 * nrows),
+            squeeze=False,
         )
-        for i, layer in enumerate(self.layer):
-            layer.plot(axs[i // self.width, i % self.width], i)
+
+        offset = 0
+        for row, row_width in enumerate(layer_widths):
+            for col in range(ncols):
+                if col < row_width and offset + col < len(self.layer):
+                    self.layer[offset + col].plot(axs[row, col], offset + col)
+                else:
+                    plt.delaxes(axs[row, col])
+            offset += row_width
+
         self.out_layer.plot(axs[-1, 0], len(self.layer))
-        for i in range(1, self.width):
-            plt.delaxes(axs[-1, i])
-        fig.savefig(path)
-        plt.close(fig)
+        for col in range(1, ncols):
+            plt.delaxes(axs[-1, col])
+
+        if path is not None:
+            fig.savefig(path)
+            plt.close(fig)
+        elif show:
+            plt.show()
+
+    def save_image(self, path):
+        self._plot_layers(path=path)
 
     def plot(self):
-        import matplotlib.pyplot as plt
-        fig, axs = plt.subplots(
-            ncols=self.width, nrows=len(self.layer) // self.width + 1,
-            figsize=(4 * self.width, 4 * (len(self.layer) // self.width + 1))
-        )
-        for i, layer in enumerate(self.layer):
-            layer.plot(axs[i // self.width, i % self.width], i)
-        self.out_layer.plot(axs[-1, 0], len(self.layer))
-        for i in range(1, self.width):
-            plt.delaxes(axs[-1, i])
-        plt.show()
+        self._plot_layers(show=True)
 
     def fidelity(self, batch, model):
         prediction = self.predict(batch)
@@ -182,9 +456,6 @@ class IDT:
         return f1_score(batch.y.cpu().numpy(), prediction, average=average)
 
     def save_output_layer_spacious(self, path, figsize=(14, 10)):
-        """
-        保存输出层决策树，使用开阔的间距
-        """
         import matplotlib.pyplot as plt
         from sklearn.tree import plot_tree
 
@@ -215,9 +486,6 @@ class IDT:
                 plt.close(fig)
 
     def plot_output_layer_spacious(self):
-        """
-        显示输出层决策树，使用开阔的间距
-        """
         import matplotlib.pyplot as plt
         from sklearn.tree import plot_tree
 
@@ -247,14 +515,18 @@ class IDT:
 
 
 class IDTInnerLayer:
-    def __init__(self, max_depth, depth_indices):
+    def __init__(self, max_depth, depth_indices, min_leaf=1):
         self.max_depth = max_depth
         self.depth_indices = [index for index in depth_indices]
         self.n_features_in = sum(depth_indices)
+        self.min_leaf = min_leaf
         self.dt = None
         self.leaf_indices = None
         self.leaf_values = None
         self.leaf_formulas = None
+        self.fit_mse_ = None
+        self.fit_r2_ = None
+        self.min_leaf_support_ = None
 
     def fit(self, x, y, adj, sample_weight=None):
         if self.n_features_in == 0:
@@ -264,9 +536,23 @@ class IDTInnerLayer:
         x = np.asarray(np.concatenate([
             x, x_neigh, x_neigh / deg.clip(1e-6, None)
         ], axis=1))
-        self.dt = DecisionTreeRegressor(max_depth=self.max_depth, splitter='random')
+        self.dt = DecisionTreeRegressor(
+            max_depth=self.max_depth,
+            splitter='random',
+            min_samples_leaf=self.min_leaf,
+            min_samples_split=max(2, 2 * self.min_leaf),
+        )
         self.dt.fit(x, y, sample_weight=sample_weight)
+
+        pred_y = self.dt.predict(x)
+        y_arr = np.asarray(y, dtype=np.float64)
+        pred_arr = np.asarray(pred_y, dtype=np.float64)
+        self.fit_mse_ = float(np.mean((y_arr - pred_arr) ** 2))
+        denom = float(np.mean((y_arr - y_arr.mean(axis=0, keepdims=True)) ** 2)) + 1e-12
+        self.fit_r2_ = float(1.0 - self.fit_mse_ / denom)
+
         leaves = _leaves(self.dt.tree_)
+        self.min_leaf_support_ = int(np.min(self.dt.tree_.n_node_samples[leaves])) if len(leaves) > 0 else 0
         leaf_values = [self.dt.tree_.value[i, :, 0] for i in leaves]
         if len(leaves) == 1:
             combinations = [{0}]
@@ -371,18 +657,24 @@ class IDTInnerLayer:
 
 
 class IDTFinalLayer:
-    def __init__(self, max_depth, ccp_alpha, depth_indices):
+    def __init__(self, max_depth, ccp_alpha, depth_indices, min_leaf=1):
         self.max_depth = max_depth
         self.ccp_alpha = ccp_alpha
         self.depth_indices = [index for index in depth_indices]
         self.n_features_in = sum(depth_indices)
+        self.min_leaf = min_leaf
         self.dt = None
         self.leaf_indices = None
         self.leaf_values = None
 
     def fit(self, x, batch, y, sample_weight=None):
         x = _pool(x, batch)
-        self.dt = DecisionTreeClassifier(max_depth=self.max_depth, ccp_alpha=self.ccp_alpha)
+        self.dt = DecisionTreeClassifier(
+            max_depth=self.max_depth,
+            ccp_alpha=self.ccp_alpha,
+            min_samples_leaf=self.min_leaf,
+            min_samples_split=max(2, 2 * self.min_leaf),
+        )
         self.dt.fit(x, y, sample_weight=sample_weight)
 
     def predict(self, x, batch):
@@ -420,7 +712,6 @@ class IDTFinalLayer:
 
 
 def _pool(x, batch):
-    # 保证 batch 在 CPU，与 x 张量一致
     batch = batch.cpu()
     return np.concatenate([
         global_mean_pool(torch.tensor(x), batch).cpu().numpy(),
@@ -471,7 +762,7 @@ def _get_values_model(batch, model):
         lambda mod, inp, out: values.append(out.detach().cpu().numpy().squeeze())
     )
     with torch.no_grad():
-        model(batch.to(device))   # 触发 hook；不需要对输出再 .numpy()
+        model(batch.to(device))
     hook.remove()
     return values[:-1]
 
